@@ -146,6 +146,7 @@ internal static class Program
             string partialFileName = $"{fileName}{fileNumber}{extension}";
             string partialFilePath = Path.Combine(directory, partialFileName);
             
+            
             // Create a new partial token with leading and trailing trivia to ensure proper spacing
             SyntaxToken partialToken = SyntaxFactory.Token(
                 SyntaxFactory.TriviaList(),
@@ -159,29 +160,112 @@ internal static class Program
                         .Concat([partialToken])))
                 .WithMembers(SyntaxFactory.List(files[i]));
             
+            // first & last member formatting - remove leading/trailing newlines
+            if (files[i].Count > 0)
+            {
+                MemberDeclarationSyntax firstMember = files[i][0];
+                MemberDeclarationSyntax updatedFirstMember = firstMember.WithLeadingTrivia(SyntaxFactory.TriviaList(SyntaxFactory.Whitespace("    ")));
+                
+                MemberDeclarationSyntax lastMember = files[i][files[i].Count - 1];
+                MemberDeclarationSyntax updatedLastMember = lastMember.WithTrailingTrivia(SyntaxFactory.TriviaList());
+
+                List<MemberDeclarationSyntax> updatedMembers = new List<MemberDeclarationSyntax>(files[i])
+                {
+                    [0] = updatedFirstMember
+                };
+                
+                if (files[i].Count == 1)
+                {
+                    updatedMembers[0] = updatedFirstMember.WithTrailingTrivia(SyntaxFactory.TriviaList());
+                }
+                else
+                {
+                    updatedMembers[files[i].Count - 1] = updatedLastMember;
+                }
+
+                partialClass = partialClass
+                    .WithOpenBraceToken(SyntaxFactory.Token(
+                        SyntaxFactory.TriviaList(),
+                        SyntaxKind.OpenBraceToken,
+                        SyntaxFactory.TriviaList(SyntaxFactory.LineFeed)))
+                    .WithMembers(SyntaxFactory.List(updatedMembers))
+                    .WithCloseBraceToken(SyntaxFactory.Token(
+                        SyntaxFactory.TriviaList(SyntaxFactory.LineFeed),
+                        SyntaxKind.CloseBraceToken,
+                        SyntaxFactory.TriviaList()));
+            }
+            else
+            {
+                partialClass = partialClass
+                    .WithOpenBraceToken(SyntaxFactory.Token(
+                        SyntaxFactory.TriviaList(),
+                        SyntaxKind.OpenBraceToken,
+                        SyntaxFactory.TriviaList(SyntaxFactory.LineFeed)))
+                    .WithCloseBraceToken(SyntaxFactory.Token(
+                        SyntaxFactory.TriviaList(SyntaxFactory.LineFeed),
+                        SyntaxKind.CloseBraceToken,
+                        SyntaxFactory.TriviaList()));
+            }
+            
             CompilationUnitSyntax newCompilationUnit;
 
             if (isFileScopedNamespace)
             {
-                // file-scoped namespace
                 FileScopedNamespaceDeclarationSyntax newFileScopedNamespace = SyntaxFactory.FileScopedNamespaceDeclaration(
                         SyntaxFactory.ParseName(namespaceName))
+                    .WithNamespaceKeyword(SyntaxFactory.Token(
+                        SyntaxFactory.TriviaList(),
+                        SyntaxKind.NamespaceKeyword,
+                        SyntaxFactory.TriviaList(SyntaxFactory.Space)))
+                    .WithSemicolonToken(SyntaxFactory.Token(
+                        SyntaxFactory.TriviaList(),
+                        SyntaxKind.SemicolonToken,
+                        SyntaxFactory.TriviaList(SyntaxFactory.LineFeed)))
                     .WithMembers(SyntaxFactory.SingletonList<MemberDeclarationSyntax>(partialClass));
 
                 newCompilationUnit = SyntaxFactory.CompilationUnit()
                     .WithUsings(usings)
                     .WithMembers(SyntaxFactory.SingletonList<MemberDeclarationSyntax>(newFileScopedNamespace));
+                
+                if (usings.Count > 0)
+                {
+                    newCompilationUnit = newCompilationUnit.WithUsings(
+                        newCompilationUnit.Usings.Replace(
+                            newCompilationUnit.Usings.Last(),
+                            newCompilationUnit.Usings.Last().WithTrailingTrivia(
+                                SyntaxFactory.TriviaList(SyntaxFactory.LineFeed, SyntaxFactory.LineFeed))));
+                }
             }
             else if (namespaceName is not null)
             {
-                // classic namespace
                 NamespaceDeclarationSyntax newNamespace = SyntaxFactory.NamespaceDeclaration(
                         SyntaxFactory.ParseName(namespaceName))
+                    .WithNamespaceKeyword(SyntaxFactory.Token(
+                        SyntaxFactory.TriviaList(),
+                        SyntaxKind.NamespaceKeyword,
+                        SyntaxFactory.TriviaList(SyntaxFactory.Space)))
+                    .WithOpenBraceToken(SyntaxFactory.Token(
+                        SyntaxFactory.TriviaList(),
+                        SyntaxKind.OpenBraceToken,
+                        SyntaxFactory.TriviaList(SyntaxFactory.LineFeed)))
+                    .WithCloseBraceToken(SyntaxFactory.Token(
+                        SyntaxFactory.TriviaList(),
+                        SyntaxKind.CloseBraceToken,
+                        SyntaxFactory.TriviaList()))
                     .WithMembers(SyntaxFactory.SingletonList<MemberDeclarationSyntax>(partialClass));
 
                 newCompilationUnit = SyntaxFactory.CompilationUnit()
                     .WithUsings(usings)
                     .WithMembers(SyntaxFactory.SingletonList<MemberDeclarationSyntax>(newNamespace));
+                
+                if (usings.Count > 0)
+                {
+                    newCompilationUnit = newCompilationUnit.WithUsings(
+                        newCompilationUnit.Usings.Replace(
+                            newCompilationUnit.Usings.Last(),
+                            newCompilationUnit.Usings.Last().WithTrailingTrivia(
+                                SyntaxFactory.TriviaList(SyntaxFactory.LineFeed, SyntaxFactory.LineFeed))));
+                }
             }
             else
             {
@@ -189,11 +273,18 @@ internal static class Program
                 newCompilationUnit = SyntaxFactory.CompilationUnit()
                     .WithUsings(usings)
                     .WithMembers(SyntaxFactory.SingletonList<MemberDeclarationSyntax>(partialClass));
+                
+                if (usings.Count > 0)
+                {
+                    newCompilationUnit = newCompilationUnit.WithUsings(
+                        newCompilationUnit.Usings.Replace(
+                            newCompilationUnit.Usings.Last(),
+                            newCompilationUnit.Usings.Last().WithTrailingTrivia(
+                                SyntaxFactory.TriviaList(SyntaxFactory.LineFeed, SyntaxFactory.LineFeed))));
+                }
             }
             
-            // Format the compilation unit to ensure proper spacing
-            CompilationUnitSyntax formattedCompilationUnit = newCompilationUnit.NormalizeWhitespace();
-            string fileContent = formattedCompilationUnit.ToFullString();
+            string fileContent = newCompilationUnit.ToFullString().Trim();
             File.WriteAllText(partialFilePath, fileContent);
             
             // count actual lines in the generated file
@@ -219,8 +310,9 @@ internal static class Program
         
         if (alreadyPartial)
         {
-            // Just update the members
-            partialClassDeclaration = classDeclaration.WithMembers(SyntaxFactory.List(membersToKeep));
+            // Just update the members while preserving trivia
+            SyntaxList<MemberDeclarationSyntax> newMembers = SyntaxFactory.List(membersToKeep);
+            partialClassDeclaration = classDeclaration.WithMembers(newMembers);
         }
         else
         {
@@ -231,12 +323,47 @@ internal static class Program
                 SyntaxFactory.TriviaList(SyntaxFactory.Space));
                 
             // Add partial modifier to the class and update members
+            SyntaxTokenList newModifiers = SyntaxFactory.TokenList(
+                classDeclaration.Modifiers
+                    .Where(m => !m.IsKind(SyntaxKind.PartialKeyword))
+                    .Concat([partialToken]));
+                    
+            SyntaxList<MemberDeclarationSyntax> newMembers = SyntaxFactory.List(membersToKeep);
+            
             partialClassDeclaration = classDeclaration
-                .WithModifiers(SyntaxFactory.TokenList(
-                    classDeclaration.Modifiers
-                        .Where(m => !m.IsKind(SyntaxKind.PartialKeyword))
-                        .Concat([partialToken])))
-                .WithMembers(SyntaxFactory.List(membersToKeep));
+                .WithModifiers(newModifiers)
+                .WithMembers(newMembers);
+        }
+                
+        if (membersToKeep.Count > 0)
+        {
+            MemberDeclarationSyntax firstMember = membersToKeep[0];
+            MemberDeclarationSyntax updatedFirstMember = firstMember.WithLeadingTrivia(SyntaxFactory.TriviaList(SyntaxFactory.Whitespace("    ")));
+
+            MemberDeclarationSyntax lastMember = membersToKeep[^1];
+            MemberDeclarationSyntax updatedLastMember = lastMember.WithTrailingTrivia(SyntaxFactory.TriviaList());
+
+            List<MemberDeclarationSyntax> updatedMembers = new List<MemberDeclarationSyntax>(membersToKeep)
+            {
+                [0] = updatedFirstMember
+            };
+            
+            if (membersToKeep.Count == 1)
+            {
+                updatedMembers[0] = updatedFirstMember.WithTrailingTrivia(SyntaxFactory.TriviaList());
+            }
+            else
+            {
+                updatedMembers[membersToKeep.Count - 1] = updatedLastMember;
+            }
+
+            SyntaxList<MemberDeclarationSyntax> newMembers = SyntaxFactory.List(updatedMembers);
+            partialClassDeclaration = partialClassDeclaration
+                .WithMembers(newMembers)
+                .WithCloseBraceToken(SyntaxFactory.Token(
+                    SyntaxFactory.TriviaList(SyntaxFactory.LineFeed),
+                    SyntaxKind.CloseBraceToken,
+                    SyntaxFactory.TriviaList()));
         }
         
         CompilationUnitSyntax newRoot;
@@ -263,14 +390,11 @@ internal static class Program
             newRoot = root.ReplaceNode(classDeclaration, partialClassDeclaration);
         }
         
-        // Format the root to ensure proper spacing
-        CompilationUnitSyntax formattedRoot = newRoot.NormalizeWhitespace();
-        
-        // Write the modified code back to the original file
-        File.WriteAllText(filePath, formattedRoot.ToFullString());
+        string originalContent = newRoot.ToFullString().Trim();
+        File.WriteAllText(filePath, originalContent);
         
         // Count actual lines in the modified file
-        int lineCount = formattedRoot.ToFullString().Split('\n').Length;
+        int lineCount = originalContent.Split('\n').Length;
         Console.WriteLine($"Original file modified to be partial with {membersToKeep.Count} members and {lineCount} lines of code.");
     }
 
