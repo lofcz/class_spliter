@@ -2,8 +2,6 @@
 
 A tiny Roslyn-based utility for splitting long C# classes into shorter ones. Pass a path to the file/files/directory with classes and optionally the LOC limit, which should not be exceeded (defaults to 1 500). The input files will then be split (if needed) into multiple partial classes named `FileName2.cs`, `FileName3.cs`, etc. If the file `FileName2.cs` already exists, we check for the first free index and number starting from it.
 
-Usage:
-
 ```
 Usage:
   Splitter [options]
