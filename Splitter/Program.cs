@@ -3,15 +3,35 @@ using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Microsoft.CodeAnalysis.Formatting;
+using System.Diagnostics; // For Debug.Assert
 
 namespace Splitter;
 
 internal static class Program
 {
     private const int DefaultMaxLines = 1_500;
+    private static int _maxLinesPerFile = DefaultMaxLines; // Store globally for access in ModifyOriginalClassToPartial warning
+
+    // Helper struct to store member and its estimated LOC
+    private readonly record struct MemberInfo(int EstimatedLoc, MemberDeclarationSyntax Member) : IComparable<MemberInfo>
+    {
+        // Sort primarily by LOC, then by original position as a tie-breaker for stability
+        public int CompareTo(MemberInfo other)
+        {
+            int locComparison = EstimatedLoc.CompareTo(other.EstimatedLoc);
+            if (locComparison != 0) return locComparison;
+            // Use SpanStart as a proxy for original order
+            return Member.SpanStart.CompareTo(other.Member.SpanStart);
+        }
+    }
+
+    // Static variable to cache base overhead LOC
+    private static int _baseOverheadLoc = -1;
+
 
     private static void Main(string[] args)
     {
+        // --- Argument Parsing ---
         if (args.Length < 1)
         {
             Console.WriteLine($"Usage: ClassSplitter.exe <filepath> [maxlines={DefaultMaxLines}]");
@@ -19,32 +39,32 @@ internal static class Program
         }
 
         string filePath = args[0];
-        int maxLinesPerFile = DefaultMaxLines; // Default value
+        int parsedMaxLines = DefaultMaxLines; // Use temporary variable for parsing
 
-        // Parse maxlines argument if provided
         var maxLinesArg = args.FirstOrDefault(a => a.StartsWith("maxlines=", StringComparison.OrdinalIgnoreCase));
         if (maxLinesArg != null)
         {
-            if (int.TryParse(maxLinesArg.Split('=')[1], out int parsedMaxLines))
+            if (int.TryParse(maxLinesArg.Split('=')[1], out int val) && val > 0)
             {
-                maxLinesPerFile = parsedMaxLines;
+                parsedMaxLines = val;
             }
             else
             {
                 Console.WriteLine($"Invalid maxlines value: {maxLinesArg.Split('=')[1]}. Using default: {DefaultMaxLines}");
             }
         }
-        else if (args.Length > 1) // Support positional argument for backward compatibility (less robust)
+        else if (args.Length > 1) // Support positional argument
         {
-             if (int.TryParse(args[1], out int parsedMaxLines))
+             if (int.TryParse(args[1], out int val) && val > 0)
              {
-                 maxLinesPerFile = parsedMaxLines;
+                 parsedMaxLines = val;
              }
              else
              {
                  Console.WriteLine($"Invalid maxlines value: {args[1]}. Using default: {DefaultMaxLines}");
              }
         }
+        _maxLinesPerFile = parsedMaxLines; // Set the global static variable
 
 
         if (!File.Exists(filePath))
@@ -53,49 +73,37 @@ internal static class Program
             return;
         }
 
-        Console.WriteLine($"Processing {filePath} with max lines per file: {maxLinesPerFile}");
-        SplitClass(filePath, maxLinesPerFile);
+        Console.WriteLine($"Processing {filePath} with max lines per file: {_maxLinesPerFile}");
+        SplitClass(filePath, _maxLinesPerFile);
     }
 
-    private static void SplitClass(string filePath, int maxLinesPerFile)
+    private static void SplitClass(string filePath, int maxLinesPerFile) // Keep parameter for clarity
     {
         string sourceCode = File.ReadAllText(filePath);
         string fileName = Path.GetFileNameWithoutExtension(filePath);
         string extension = Path.GetExtension(filePath);
         string directory = Path.GetDirectoryName(filePath) ?? ".";
 
+        // --- Parsing and Validation ---
         SyntaxTree tree = CSharpSyntaxTree.ParseText(sourceCode, CSharpParseOptions.Default.WithLanguageVersion(LanguageVersion.Latest));
         CompilationUnitSyntax root = tree.GetCompilationUnitRoot();
         var diagnostics = tree.GetDiagnostics();
         if (diagnostics.Any(d => d.Severity == DiagnosticSeverity.Error))
         {
             Console.WriteLine("Error parsing file. Please fix syntax errors:");
-            foreach (var diag in diagnostics.Where(d => d.Severity == DiagnosticSeverity.Error))
-            {
-                Console.WriteLine($"- {diag}");
-            }
+            foreach (var diag in diagnostics.Where(d => d.Severity == DiagnosticSeverity.Error)) Console.WriteLine($"- {diag}");
             return;
         }
 
-
         SyntaxList<UsingDirectiveSyntax> usings = root.Usings;
-
-        // Find the class declaration, handling different namespace types
         ClassDeclarationSyntax? originalClassDeclaration = null;
-        BaseNamespaceDeclarationSyntax? namespaceSyntax = null; // Covers both NamespaceDeclarationSyntax and FileScopedNamespaceDeclarationSyntax
-        string? namespaceName = null;
-        bool isFileScopedNamespace = false;
+        BaseNamespaceDeclarationSyntax? namespaceSyntax = null;
 
-        // Try finding class within a namespace (block or file-scoped)
         namespaceSyntax = root.Members.OfType<BaseNamespaceDeclarationSyntax>().FirstOrDefault();
         if (namespaceSyntax != null)
         {
             originalClassDeclaration = namespaceSyntax.Members.OfType<ClassDeclarationSyntax>().FirstOrDefault();
-            namespaceName = namespaceSyntax.Name.ToString();
-            isFileScopedNamespace = namespaceSyntax is FileScopedNamespaceDeclarationSyntax;
         }
-
-        // If not found in a namespace, try finding it directly in the root
         originalClassDeclaration ??= root.Members.OfType<ClassDeclarationSyntax>().FirstOrDefault();
 
         if (originalClassDeclaration == null)
@@ -104,165 +112,309 @@ internal static class Program
             return;
         }
 
-        // Check initial line count - if already compliant, no need to split
         int initialLineCount = CountLines(sourceCode);
         if (initialLineCount <= maxLinesPerFile)
         {
             Console.WriteLine($"Class '{originalClassDeclaration.Identifier.Text}' doesn't need to be split ({initialLineCount} lines <= {maxLinesPerFile}).");
             return;
         }
-
         Console.WriteLine($"Initial class '{originalClassDeclaration.Identifier.Text}' has {initialLineCount} lines, exceeding limit of {maxLinesPerFile}. Splitting...");
 
-        List<MemberDeclarationSyntax> allMembers = originalClassDeclaration.Members.ToList();
-        List<List<MemberDeclarationSyntax>> newFilesMembers = []; // Members for the new partial files
-        List<MemberDeclarationSyntax> membersToKeepInOriginal = []; // Members to keep in the first (original) file
 
-        // --- Distribution Logic ---
-        List<MemberDeclarationSyntax> currentFileMembers = [];
-        bool firstFile = true;
-
-        // Use a temporary workspace for formatting to get accurate line counts
+        // --- Pre-calculate Member LOC & Setup Tracking ---
         using var workspace = new AdhocWorkspace();
+        List<MemberInfo> allMemberInfos = [];
+        // Calculate and cache base overhead LOC
+        _baseOverheadLoc = CalculateOverheadLoc(workspace, usings, namespaceSyntax, originalClassDeclaration);
 
-        foreach (MemberDeclarationSyntax member in allMembers)
+        Console.WriteLine("Calculating estimated LOC for each member...");
+        foreach (MemberDeclarationSyntax memberSyntax in originalClassDeclaration.Members)
         {
-            List<MemberDeclarationSyntax> testMembers = [.. currentFileMembers, member];
-            string testContent;
-            int currentFileLines;
+            // Estimate LOC by generating a file with only this member + overhead
+            string memberContent = GenerateFileContent(workspace, usings, namespaceSyntax, originalClassDeclaration, [memberSyntax], false);
+            int memberTotalLoc = CountLines(memberContent);
+            // Ensure estimate is at least base overhead + 1 line for the member itself.
+            int estimatedLoc = Math.Max(_baseOverheadLoc + 1, memberTotalLoc);
+            allMemberInfos.Add(new MemberInfo(estimatedLoc, memberSyntax));
 
-            if (firstFile)
+            if (memberTotalLoc > maxLinesPerFile)
             {
-                // Test adding to the original file
-                testContent = GenerateFileContent(workspace, usings, namespaceSyntax, originalClassDeclaration, testMembers, true); // isOriginal=true
-                currentFileLines = CountLines(testContent);
-
-                if (currentFileLines <= maxLinesPerFile)
-                {
-                    currentFileMembers.Add(member); // Add to current (original) file's list
-                }
-                else
-                {
-                    // Current member makes the original file too large.
-                    // Finalize the original file with members collected so far.
-                    membersToKeepInOriginal.AddRange(currentFileMembers);
-                    firstFile = false; // Start filling new files
-
-                    // Now check if the current member *alone* fits in a *new* file
-                    currentFileMembers = [member]; // Start new file list with current member
-                    testContent = GenerateFileContent(workspace, usings, namespaceSyntax, originalClassDeclaration, currentFileMembers, false); // isOriginal=false
-                    currentFileLines = CountLines(testContent);
-
-                    if (currentFileLines > maxLinesPerFile)
-                    {
-                        // Even a single member is too large for a new file!
-                        Console.WriteLine($"Warning: Member starting on line {member.GetLocation().GetLineSpan().StartLinePosition.Line + 1} is too large ({currentFileLines} lines with overhead) to fit within the {maxLinesPerFile} line limit even in its own file. It will be placed in a new file exceeding the limit.");
-                        // Add this oversized member list to newFilesMembers and clear currentFileMembers
-                        newFilesMembers.Add(currentFileMembers);
-                        currentFileMembers = [];
-                    }
-                    // If it fits alone, currentFileMembers is correctly initialized for the next iteration
-                }
-            }
-            else // Filling subsequent new files
-            {
-                testContent = GenerateFileContent(workspace, usings, namespaceSyntax, originalClassDeclaration, testMembers, false); // isOriginal=false
-                currentFileLines = CountLines(testContent);
-
-                if (currentFileLines <= maxLinesPerFile)
-                {
-                    currentFileMembers.Add(member); // Add to current new file's list
-                }
-                else
-                {
-                    // Current member makes the *current new file* too large.
-                    // Finalize the previous new file.
-                    if (currentFileMembers.Count > 0) // Ensure we don't add empty lists
-                    {
-                        newFilesMembers.Add(currentFileMembers);
-                    }
-
-                    // Start a new file list with the current member
-                    currentFileMembers = [member];
-
-                    // Re-check if this single member fits in a new file (edge case)
-                    testContent = GenerateFileContent(workspace, usings, namespaceSyntax, originalClassDeclaration, currentFileMembers, false); // isOriginal=false
-                    currentFileLines = CountLines(testContent);
-                    if (currentFileLines > maxLinesPerFile)
-                    {
-                        Console.WriteLine($"Warning: Member starting on line {member.GetLocation().GetLineSpan().StartLinePosition.Line + 1} is too large ({currentFileLines} lines with overhead) to fit within the {maxLinesPerFile} line limit even in its own file. It will be placed in a new file exceeding the limit.");
-                        // Add this oversized member list to newFilesMembers and clear currentFileMembers
-                        newFilesMembers.Add(currentFileMembers);
-                        currentFileMembers = [];
-                    }
-                     // If it fits alone, currentFileMembers is correctly initialized for the next iteration
-                }
+                 Console.WriteLine($"Warning: Member starting near line {memberSyntax.GetLocation().GetLineSpan().StartLinePosition.Line + 1} is estimated to be too large ({memberTotalLoc} lines with overhead) to fit within the {maxLinesPerFile} line limit even in its own file.");
             }
         }
+        Console.WriteLine($"Calculated LOC for {allMemberInfos.Count} members.");
 
-        // Add the last collected members
-        if (firstFile)
+        List<MemberDeclarationSyntax> allMembersInOrder = originalClassDeclaration.Members.ToList();
+        List<List<MemberDeclarationSyntax>> newFilesMembers = [];
+        List<MemberDeclarationSyntax> membersToKeepInOriginal = [];
+        List<MemberDeclarationSyntax> currentFileMembers = [];
+
+        // Track remaining members efficiently
+        var remainingMemberInfos = allMemberInfos.ToDictionary(info => info.Member, info => info);
+        // Keep a separate list sorted by LOC for finding fillers
+        var remainingMembersSortedByLoc = allMemberInfos.OrderBy(m => m).ToList();
+
+        int currentFileLoc = _baseOverheadLoc; // Start with overhead
+        bool processingOriginalFile = true;
+
+        // --- Optimized Distribution Loop ---
+        while (remainingMemberInfos.Count > 0) // Loop while members remain unplaced
         {
-            // All members fit in the original file (should have been caught earlier, but safety check)
-            membersToKeepInOriginal.AddRange(currentFileMembers);
-        }
-        else if (currentFileMembers.Count > 0)
+            // Find the next *sequential* member that hasn't been placed yet
+            MemberDeclarationSyntax? nextSequentialMember = null;
+            MemberInfo? nextSequentialMemberInfo = null;
+
+            // Find the first member from original order that is still in remainingMemberInfos
+            // This ensures we process members sequentially unless we add a filler
+            foreach(var member in allMembersInOrder)
+            {
+                 if (remainingMemberInfos.ContainsKey(member))
+                 {
+                     nextSequentialMember = member;
+                     nextSequentialMemberInfo = remainingMemberInfos[member];
+                     break;
+                 }
+            }
+
+            if (nextSequentialMember == null || nextSequentialMemberInfo == null)
+            {
+                // Should not happen if remainingMemberInfos.Count > 0, but safety check
+                Console.WriteLine("Error: No remaining sequential member found, but remaining count > 0. Exiting loop.");
+                break;
+            }
+
+            // --- Test adding the sequential member ---
+            int locAddingSequential = CountLines(GenerateFileContent(workspace, usings, namespaceSyntax, originalClassDeclaration, [.. currentFileMembers, nextSequentialMember], processingOriginalFile));
+
+            // --- Case 1: Sequential member fits ---
+            if (locAddingSequential <= maxLinesPerFile)
+            {
+                currentFileMembers.Add(nextSequentialMember);
+                currentFileLoc = locAddingSequential;
+
+                // Remove from tracking
+                bool removedFromDict = remainingMemberInfos.Remove(nextSequentialMember);
+                bool removedFromList = remainingMembersSortedByLoc.Remove(nextSequentialMemberInfo.Value);
+                Debug.Assert(removedFromDict && removedFromList, "Sequential member should have been present in tracking collections");
+            }
+            // --- Case 2: Sequential member does NOT fit ---
+            else
+            {
+                // --- Subcase 2a: Try to find a filler ---
+                int remainingSpace = maxLinesPerFile - currentFileLoc;
+                MemberInfo? fillerInfo = FindLargestFittingMember(remainingMembersSortedByLoc, nextSequentialMemberInfo.Value, remainingSpace); // Pass necessary info
+
+                bool fillerAdded = false;
+                if (fillerInfo.HasValue)
+                {
+                    var fillerMember = fillerInfo.Value.Member;
+                    // Actual check
+                    int locAddingFiller = CountLines(GenerateFileContent(workspace, usings, namespaceSyntax, originalClassDeclaration, [.. currentFileMembers, fillerMember], processingOriginalFile));
+
+                    if (locAddingFiller <= maxLinesPerFile)
+                    {
+                        // Filler fits! Add it.
+                        currentFileMembers.Add(fillerMember);
+                        currentFileLoc = locAddingFiller;
+
+                        // Remove filler from tracking
+                        bool removedFromDict = remainingMemberInfos.Remove(fillerMember);
+                        bool removedFromList = remainingMembersSortedByLoc.Remove(fillerInfo.Value);
+                        Debug.Assert(removedFromDict && removedFromList, "Filler member should have been present in tracking collections");
+
+                        Console.WriteLine($"    -> Sequential member (est. {nextSequentialMemberInfo.Value.EstimatedLoc} LOC) didn't fit. Added smaller filler member (est. {fillerInfo.Value.EstimatedLoc} LOC).");
+                        fillerAdded = true;
+                        // Loop continues, the original sequential member (nextSequentialMember) is still in remainingMemberInfos
+                        // and will be considered again in the next iteration of the while loop.
+                    }
+                    else
+                    {
+                         Console.WriteLine($"    -> Candidate filler member (est. {fillerInfo.Value.EstimatedLoc} LOC) did not actually fit (would be {locAddingFiller} LOC).");
+                         // Proceed to split (handled below)
+                    }
+                }
+
+                // --- Subcase 2b: No filler added (none found or actual check failed) ---
+                if (!fillerAdded)
+                {
+                    Console.WriteLine($"    -> Sequential member (est. {nextSequentialMemberInfo.Value.EstimatedLoc} LOC) didn't fit. No other suitable member found. Splitting.");
+
+                    // Finalize the current file (only if it contains members)
+                    if (currentFileMembers.Count > 0)
+                    {
+                         FinalizeCurrentFile(processingOriginalFile, currentFileMembers, membersToKeepInOriginal, newFilesMembers);
+                    }
+                    // If processingOriginalFile is true and currentFileMembers is empty, it means
+                    // the very first member didn't fit, so membersToKeepInOriginal remains empty, which is correct.
+
+                    // Start the new file with the sequential member that didn't fit
+                    processingOriginalFile = false; // Now processing subsequent files
+                    currentFileMembers = [nextSequentialMember]; // Reset list for the new file
+                    currentFileLoc = CountLines(GenerateFileContent(workspace, usings, namespaceSyntax, originalClassDeclaration, currentFileMembers, false)); // Calculate LOC for the new file
+
+                    // Check edge case: single member too large for new file
+                    if (currentFileLoc > maxLinesPerFile)
+                    {
+                        Console.WriteLine($"Warning: Member starting near line {nextSequentialMember.GetLocation().GetLineSpan().StartLinePosition.Line + 1} (est. {nextSequentialMemberInfo.Value.EstimatedLoc} LOC) is too large ({currentFileLoc} lines with overhead) for a new file. Placing it in its own oversized file.");
+                        // Finalize this single-member oversized file immediately
+                        FinalizeCurrentFile(false, currentFileMembers, membersToKeepInOriginal, newFilesMembers);
+                        currentFileMembers = []; // Reset list, ready for the *next* sequential member
+                        currentFileLoc = _baseOverheadLoc; // Reset LOC for the (now empty) next potential file
+                    }
+                    // Else: Member fits in the new file, currentFileMembers/Loc are correctly set for the next iteration.
+
+                    // Remove the sequential member from tracking as it's now placed (either in the new file or its own oversized one)
+                    bool removedFromDict = remainingMemberInfos.Remove(nextSequentialMember);
+                    bool removedFromList = remainingMembersSortedByLoc.Remove(nextSequentialMemberInfo.Value);
+                    Debug.Assert(removedFromDict && removedFromList, "Sequential member (that caused split) should have been present in tracking collections");
+                }
+            }
+        } // End while loop
+
+        // Add the very last batch of members if any remain after the loop
+        if (currentFileMembers.Count > 0)
         {
-            // Add the last batch of members for a new file
-            newFilesMembers.Add(currentFileMembers);
+            FinalizeCurrentFile(processingOriginalFile, currentFileMembers, membersToKeepInOriginal, newFilesMembers);
         }
 
 
         // --- File Generation ---
-
-        if (newFilesMembers.Count == 0)
+        if (newFilesMembers.Count == 0 && membersToKeepInOriginal.Count == originalClassDeclaration.Members.Count)
         {
-            // This should ideally not happen if the initial check passed and splitting was needed,
-            // but handle it defensively.
-             int finalOriginalLineCount = CountLines(GenerateFileContent(workspace, usings, namespaceSyntax, originalClassDeclaration, membersToKeepInOriginal, true));
-            Console.WriteLine($"Splitting resulted in no new files. Original file has {membersToKeepInOriginal.Count} members and {finalOriginalLineCount} lines.");
-             if (finalOriginalLineCount > maxLinesPerFile) {
-                 Console.WriteLine($"Warning: The original file still exceeds the line limit ({finalOriginalLineCount} > {maxLinesPerFile}). This might indicate an issue with a single large member or the overhead calculation.");
-             }
-             // Optionally, still write the potentially modified original file if membersToKeepInOriginal differs from allMembers
-             // ModifyOriginalClassToPartial(workspace, filePath, root, usings, namespaceSyntax, originalClassDeclaration, membersToKeepInOriginal);
-            return; // Exit if no new files were generated
+            // This case should have been caught by the initial check, but safety first.
+            Console.WriteLine("Splitting resulted in no changes. Original file remains as is.");
+            return;
         }
+         if (newFilesMembers.Count == 0 && membersToKeepInOriginal.Count < originalClassDeclaration.Members.Count)
+        {
+             // This means some members were removed but no new file created (e.g. they were too large?)
+             // Or the logic decided to only keep a subset in the original.
+             Console.WriteLine($"Splitting resulted in only modifying the original file.");
+             // Proceed to modify original, but don't create new files.
+         }
+
 
         // Modify the original file
         ModifyOriginalClassToPartial(workspace, filePath, root, usings, namespaceSyntax, originalClassDeclaration, membersToKeepInOriginal);
 
         // Create new partial class files
-        int startNumber = FindNextAvailableNumber(directory, fileName, extension);
-        for (int i = 0; i < newFilesMembers.Count; i++)
+        if (newFilesMembers.Count > 0)
         {
-            int fileNumber = startNumber + i;
-            string partialFileName = $"{fileName}{fileNumber}{extension}";
-            string partialFilePath = Path.Combine(directory, partialFileName);
-            List<MemberDeclarationSyntax> membersForThisFile = newFilesMembers[i];
+            int startNumber = FindNextAvailableNumber(directory, fileName, extension);
+            for (int i = 0; i < newFilesMembers.Count; i++)
+            {
+                int fileNumber = startNumber + i;
+                string partialFileName = $"{fileName}{fileNumber}{extension}";
+                string partialFilePath = Path.Combine(directory, partialFileName);
+                List<MemberDeclarationSyntax> membersForThisFile = newFilesMembers[i];
 
-            string fileContent = GenerateFileContent(workspace, usings, namespaceSyntax, originalClassDeclaration, membersForThisFile, false); // isOriginal=false
-            int lineCount = CountLines(fileContent);
+                string fileContent = GenerateFileContent(workspace, usings, namespaceSyntax, originalClassDeclaration, membersForThisFile, false); // isOriginal=false
+                int lineCount = CountLines(fileContent);
 
-            // Ensure the generated content doesn't accidentally exceed the limit (sanity check)
-             if (lineCount > maxLinesPerFile)
-             {
-                 Console.WriteLine($"Warning: Generated file '{partialFilePath}' has {lineCount} lines, exceeding the limit of {maxLinesPerFile}. This likely means a single member plus overhead was too large.");
-             }
+                if (lineCount > maxLinesPerFile)
+                {
+                    Console.WriteLine($"Warning: Generated file '{partialFilePath}' has {lineCount} lines, exceeding the limit of {maxLinesPerFile}. This likely means a single member plus overhead was too large.");
+                }
 
-            File.WriteAllText(partialFilePath, fileContent);
-            Console.WriteLine($"Created file: {partialFileName} with {membersForThisFile.Count} members and {lineCount} lines.");
+                File.WriteAllText(partialFilePath, fileContent);
+                Console.WriteLine($"Created file: {partialFileName} with {membersForThisFile.Count} members and {lineCount} lines.");
+            }
+             Console.WriteLine($"Class split into {newFilesMembers.Count + 1} files (original + {newFilesMembers.Count} new), numbered starting from {startNumber}.");
         }
-
-        Console.WriteLine($"Class split into {newFilesMembers.Count + 1} files (original + {newFilesMembers.Count} new), numbered starting from {startNumber}.");
+        else {
+             Console.WriteLine($"Original file modified. No new files created.");
+        }
     }
 
     // --- Helper Methods ---
 
     /// <summary>
-    /// Generates the complete C# file content for a partial class.
+    /// Helper to finalize the current list of members, adding it either to the
+    /// original list or the list of new files.
     /// </summary>
-     private static string GenerateFileContent(
+    private static void FinalizeCurrentFile(
+        bool isOriginal,
+        List<MemberDeclarationSyntax> currentMembers,
+        List<MemberDeclarationSyntax> originalFileMembersTarget,
+        List<List<MemberDeclarationSyntax>> newFilesTarget)
+    {
+        // No need to check currentMembers.Count == 0 here,
+        // the calling logic ensures it's only called when needed.
+
+        if (isOriginal)
+        {
+            // Should only happen once for the very first file's members
+            Debug.Assert(originalFileMembersTarget.Count == 0, "Original file members should only be assigned once.");
+            originalFileMembersTarget.AddRange(currentMembers);
+        }
+        else
+        {
+            newFilesTarget.Add(new List<MemberDeclarationSyntax>(currentMembers)); // Add a copy
+        }
+        // DO NOT clear currentMembers here. The calling logic resets it when starting a new file.
+    }
+
+
+    /// <summary>
+    /// Finds the largest member (by estimated LOC) in the sorted list that might fit
+    /// within the remaining space, excluding the specified memberToExclude.
+    /// Uses the *estimated* LOC for candidate selection.
+    /// </summary>
+    private static MemberInfo? FindLargestFittingMember(
+        List<MemberInfo> currentSortedRemainingMembers, // Pass the current list state
+        MemberInfo memberToExclude, // The sequential member that didn't fit
+        int remainingLineSpace) // Space available BEFORE adding anything new
+    {
+        MemberInfo? bestFit = null;
+
+        // Iterate downwards from the end of the *current* sorted list of *remaining* members
+        for (int i = currentSortedRemainingMembers.Count - 1; i >= 0; i--)
+        {
+            var candidate = currentSortedRemainingMembers[i];
+
+            // Skip the member we are trying *not* to add sequentially right now
+            if (candidate.Member == memberToExclude.Member)
+            {
+                continue;
+            }
+
+            // Estimate the increase in lines this candidate would cause.
+            // This is the candidate's total estimated lines minus the base overhead.
+            int estimatedIncrease = Math.Max(1, candidate.EstimatedLoc - _baseOverheadLoc);
+
+            // Check if the estimated *increase* fits within the available space
+            if (estimatedIncrease <= remainingLineSpace)
+            {
+                // This is the largest fitting candidate found so far (due to iteration order)
+                bestFit = candidate;
+                break; // Found the best (largest fitting) one
+            }
+        }
+
+        return bestFit;
+    }
+
+    /// <summary>
+    /// Calculates the LOC of an empty partial class file with boilerplate. Caches the result.
+    /// </summary>
+     private static int CalculateOverheadLoc(
+        Workspace workspace,
+        SyntaxList<UsingDirectiveSyntax> usings,
+        BaseNamespaceDeclarationSyntax? namespaceSyntax,
+        ClassDeclarationSyntax originalClassDeclaration)
+     {
+         // Return cached value if available
+         if (_baseOverheadLoc != -1) return _baseOverheadLoc;
+
+         // Calculate otherwise
+         string emptyContent = GenerateFileContent(workspace, usings, namespaceSyntax, originalClassDeclaration, [], false);
+         _baseOverheadLoc = CountLines(emptyContent);
+         return _baseOverheadLoc;
+     }
+
+
+    // --- GenerateFileContent (Unchanged from original) ---
+    private static string GenerateFileContent(
         Workspace workspace,
         SyntaxList<UsingDirectiveSyntax> usings,
         BaseNamespaceDeclarationSyntax? namespaceSyntax,
@@ -270,140 +422,57 @@ internal static class Program
         List<MemberDeclarationSyntax> members,
         bool isOriginalFileModification)
     {
-        // 1. Create the partial class declaration (handles 'partial' keyword, members, braces)
         ClassDeclarationSyntax partialClass = CreatePartialClassDeclaration(originalClassDeclaration, members, isOriginalFileModification);
-
-        // 2. Prepare the top-level member (namespace or class)
         MemberDeclarationSyntax topLevelMember;
-        if (namespaceSyntax is FileScopedNamespaceDeclarationSyntax fileScopedNamespace)
-        {
-            // Ensure exactly ONE newline after the semicolon. Formatter handles the rest.
-            var semicolonWithTrivia = fileScopedNamespace.SemicolonToken
-                .WithTrailingTrivia(SyntaxFactory.ElasticEndOfLine(Environment.NewLine)); // SINGLE newline
+        if (namespaceSyntax is FileScopedNamespaceDeclarationSyntax fileScopedNamespace) {
+            var semicolonWithTrivia = fileScopedNamespace.SemicolonToken.WithTrailingTrivia(SyntaxFactory.ElasticEndOfLine(Environment.NewLine));
+            topLevelMember = fileScopedNamespace.WithMembers(SyntaxFactory.SingletonList<MemberDeclarationSyntax>(partialClass)).WithSemicolonToken(semicolonWithTrivia);
+        } else if (namespaceSyntax is NamespaceDeclarationSyntax blockNamespace) {
+             var openBraceWithTrivia = blockNamespace.OpenBraceToken.WithTrailingTrivia(SyntaxFactory.ElasticEndOfLine(Environment.NewLine));
+             var closeBraceWithTrivia = blockNamespace.CloseBraceToken.WithLeadingTrivia(SyntaxFactory.ElasticEndOfLine(Environment.NewLine));
+            topLevelMember = blockNamespace.WithMembers(SyntaxFactory.SingletonList<MemberDeclarationSyntax>(partialClass)).WithOpenBraceToken(openBraceWithTrivia).WithCloseBraceToken(closeBraceWithTrivia);
+        } else { topLevelMember = partialClass; }
 
-            topLevelMember = fileScopedNamespace
-                .WithMembers(SyntaxFactory.SingletonList<MemberDeclarationSyntax>(partialClass))
-                .WithSemicolonToken(semicolonWithTrivia);
-        }
-        else if (namespaceSyntax is NamespaceDeclarationSyntax blockNamespace)
-        {
-            // Ensure ONE newline after the opening brace.
-            var openBraceWithTrivia = blockNamespace.OpenBraceToken
-                .WithTrailingTrivia(SyntaxFactory.ElasticEndOfLine(Environment.NewLine)); // SINGLE newline
-
-            // Ensure ONE newline before the closing brace.
-            var closeBraceWithTrivia = blockNamespace.CloseBraceToken
-                 .WithLeadingTrivia(SyntaxFactory.ElasticEndOfLine(Environment.NewLine)); // SINGLE newline
-
-            topLevelMember = blockNamespace
-                .WithMembers(SyntaxFactory.SingletonList<MemberDeclarationSyntax>(partialClass))
-                .WithOpenBraceToken(openBraceWithTrivia)
-                .WithCloseBraceToken(closeBraceWithTrivia);
-        }
-        else // No namespace
-        {
-            topLevelMember = partialClass;
-        }
-
-        // 3. Create the compilation unit and handle usings trivia
         CompilationUnitSyntax compilationUnit = SyntaxFactory.CompilationUnit();
-
-        if (usings.Count > 0)
-        {
-            // Ensure the last using has appropriate trailing trivia
-            // We want ONE blank line (two newlines) between usings and the next element (namespace or class)
+        if (usings.Count > 0) {
             var lastUsing = usings.Last();
             var triviaList = new List<SyntaxTrivia> { SyntaxFactory.ElasticEndOfLine(Environment.NewLine) };
-
-            // Check if the next element is not immediately following (needs a blank line)
-            // This check is simplified: assume a blank line is always desired after usings if something follows.
-            if (namespaceSyntax != null || members.Count > 0 || topLevelMember is ClassDeclarationSyntax) // Check if there's something after usings
-            {
-                 triviaList.Add(SyntaxFactory.ElasticEndOfLine(Environment.NewLine)); // Add the second newline for a blank line
-            }
-
+            if (namespaceSyntax != null || members.Count > 0 || topLevelMember is ClassDeclarationSyntax) { triviaList.Add(SyntaxFactory.ElasticEndOfLine(Environment.NewLine)); }
             var lastUsingWithTrivia = lastUsing.WithTrailingTrivia(triviaList);
             compilationUnit = compilationUnit.WithUsings(usings.Replace(lastUsing, lastUsingWithTrivia));
         }
-
-
-        // Add the main content (namespace or class)
         compilationUnit = compilationUnit.AddMembers(topLevelMember);
-
-
-        // 4. Format the code (crucial for accurate line count and final appearance)
-        // Consider customizing formatting options if default behavior isn't perfect
-        // var options = workspace.Options; //.WithChangedOption(...);
-        SyntaxNode formattedNode = Formatter.Format(compilationUnit, workspace/*, options*/);
+        SyntaxNode formattedNode = Formatter.Format(compilationUnit, workspace);
         return formattedNode.ToFullString();
     }
-    
-    /// <summary>
-    /// Creates a ClassDeclarationSyntax, ensuring it has the partial modifier
-    /// and includes the specified members. Handles trivia for braces.
-    /// </summary>
-    private static ClassDeclarationSyntax CreatePartialClassDeclaration(
+
+    // --- CreatePartialClassDeclaration (Unchanged from original) ---
+     private static ClassDeclarationSyntax CreatePartialClassDeclaration(
         ClassDeclarationSyntax originalClassDeclaration,
         List<MemberDeclarationSyntax> members,
         bool isOriginalFileModification)
     {
         SyntaxTokenList modifiers = originalClassDeclaration.Modifiers;
         bool needsPartialKeyword = !modifiers.Any(m => m.IsKind(SyntaxKind.PartialKeyword));
-
-        if (needsPartialKeyword)
-        {
-            SyntaxToken partialKeyword = SyntaxFactory.Token(
-                    SyntaxFactory.TriviaList(), // No leading trivia here
-                    SyntaxKind.PartialKeyword,
-                    SyntaxFactory.TriviaList(SyntaxFactory.Space)); // Space after partial
-
-            int insertIndex = 0; // Default: beginning
+        if (needsPartialKeyword) {
+            SyntaxToken partialKeyword = SyntaxFactory.Token(SyntaxFactory.TriviaList(), SyntaxKind.PartialKeyword, SyntaxFactory.TriviaList(SyntaxFactory.Space));
+            int insertIndex = 0;
              var accessModifiers = new[] { SyntaxKind.PublicKeyword, SyntaxKind.InternalKeyword, SyntaxKind.ProtectedKeyword, SyntaxKind.PrivateKeyword };
-             var otherModifiers = new[] { SyntaxKind.StaticKeyword, SyntaxKind.AbstractKeyword, SyntaxKind.SealedKeyword }; // Order matters slightly
-
+             var otherModifiers = new[] { SyntaxKind.StaticKeyword, SyntaxKind.AbstractKeyword, SyntaxKind.SealedKeyword };
              var lastAccess = modifiers.LastOrDefault(m => accessModifiers.Contains(m.Kind()));
              var lastOther = modifiers.LastOrDefault(m => otherModifiers.Contains(m.Kind()));
-
-             if (lastAccess.IsKind(SyntaxKind.None) && lastOther.IsKind(SyntaxKind.None)) {
-                 insertIndex = 0; // No modifiers, add at start
-             } else if (!lastAccess.IsKind(SyntaxKind.None) && lastOther.IsKind(SyntaxKind.None)) {
-                 insertIndex = modifiers.IndexOf(lastAccess) + 1; // After access modifier
-             } else if (lastAccess.IsKind(SyntaxKind.None) && !lastOther.IsKind(SyntaxKind.None)) {
-                 insertIndex = modifiers.IndexOf(lastOther) + 1; // After other modifier (e.g. static partial class)
-             } else { // Both exist, put after the one that appears later
-                 insertIndex = Math.Max(modifiers.IndexOf(lastAccess), modifiers.IndexOf(lastOther)) + 1;
-             }
-
+             if (lastAccess.IsKind(SyntaxKind.None) && lastOther.IsKind(SyntaxKind.None)) insertIndex = 0;
+             else if (!lastAccess.IsKind(SyntaxKind.None) && lastOther.IsKind(SyntaxKind.None)) insertIndex = modifiers.IndexOf(lastAccess) + 1;
+             else if (lastAccess.IsKind(SyntaxKind.None) && !lastOther.IsKind(SyntaxKind.None)) insertIndex = modifiers.IndexOf(lastOther) + 1;
+             else insertIndex = Math.Max(modifiers.IndexOf(lastAccess), modifiers.IndexOf(lastOther)) + 1;
             modifiers = modifiers.Insert(insertIndex, partialKeyword);
         }
-        // If it's already partial, we just use the existing modifiers list.
-
-        // Adjust trivia for class braces for better formatting control by Formatter
-        SyntaxToken openBrace = originalClassDeclaration.OpenBraceToken
-            .WithLeadingTrivia(SyntaxFactory.TriviaList(SyntaxFactory.Space)) // Space before {
-            .WithTrailingTrivia(SyntaxFactory.TriviaList(SyntaxFactory.ElasticEndOfLine(Environment.NewLine))); // Newline after {
-
-        SyntaxToken closeBrace = originalClassDeclaration.CloseBraceToken
-             .WithLeadingTrivia(SyntaxFactory.TriviaList(SyntaxFactory.ElasticEndOfLine(Environment.NewLine))); // Newline before }
-             // Trailing trivia for close brace is handled by container or EOF
-
-        // Create the class node. Crucially, don't add explicit leading trivia here.
-        // Let the trivia from the preceding element (namespace ;, namespace {, or using) dictate the spacing.
-        return originalClassDeclaration
-            .WithModifiers(modifiers)
-            .WithMembers(SyntaxFactory.List(members))
-            .WithOpenBraceToken(openBrace)
-            .WithCloseBraceToken(closeBrace);
-            // If the very first token of the modified class needs specific *leading* trivia adjustment,
-            // it might be better done *after* this creation, just before adding to the namespace/compilation unit,
-            // but relying on the formatter is usually preferred.
+        SyntaxToken openBrace = originalClassDeclaration.OpenBraceToken.WithLeadingTrivia(SyntaxFactory.TriviaList(SyntaxFactory.Space)).WithTrailingTrivia(SyntaxFactory.TriviaList(SyntaxFactory.ElasticEndOfLine(Environment.NewLine)));
+        SyntaxToken closeBrace = originalClassDeclaration.CloseBraceToken.WithLeadingTrivia(SyntaxFactory.TriviaList(SyntaxFactory.ElasticEndOfLine(Environment.NewLine)));
+        return originalClassDeclaration.WithModifiers(modifiers).WithMembers(SyntaxFactory.List(members)).WithOpenBraceToken(openBrace).WithCloseBraceToken(closeBrace);
     }
 
-
-    /// <summary>
-    /// Modifies the original class file to contain only the specified members
-    /// and ensures the 'partial' modifier is present.
-    /// </summary>
+    // --- ModifyOriginalClassToPartial (Now uses static _maxLinesPerFile) ---
     private static void ModifyOriginalClassToPartial(
         Workspace workspace,
         string filePath,
@@ -413,65 +482,48 @@ internal static class Program
         ClassDeclarationSyntax originalClassDeclaration,
         List<MemberDeclarationSyntax> membersToKeep)
     {
-        string finalContent = GenerateFileContent(workspace, usings, namespaceSyntax, originalClassDeclaration, membersToKeep, true); // isOriginal=true
+        // Ensure the list isn't empty if the original file should be empty (though unlikely)
+        // if (membersToKeep.Count == 0) {
+        //     Console.WriteLine("Warning: Original file is being emptied.");
+        // }
+
+        string finalContent = GenerateFileContent(workspace, usings, namespaceSyntax, originalClassDeclaration, membersToKeep, true);
         int lineCount = CountLines(finalContent);
 
         File.WriteAllText(filePath, finalContent);
         Console.WriteLine($"Modified original file: {Path.GetFileName(filePath)} with {membersToKeep.Count} members and {lineCount} lines.");
+         // Use the static field holding the parsed max lines value
+         if (membersToKeep.Count > 0 && lineCount > _maxLinesPerFile) // Only warn if not empty and exceeding
+         {
+              Console.WriteLine($"Warning: Modified original file still exceeds the line limit ({lineCount} > {_maxLinesPerFile}).");
+         }
     }
 
-    /// <summary>
-    /// Counts lines in a string, handling different newline conventions.
-    /// </summary>
+    // --- CountLines (Unchanged from original) ---
     private static int CountLines(string text)
     {
         if (string.IsNullOrEmpty(text)) return 0;
-        // Normalize line endings to \n then split
         string normalizedText = text.Replace("\r\n", "\n").Replace("\r", "\n");
-        // Split and count. Add 1 because splitting by N delimiters results in N+1 parts.
-        // If the text ends with a newline, the last part will be empty, which is correct.
         return normalizedText.Split('\n').Length;
     }
 
-
-    /// <summary>
-    /// Finds the next available number for partial class files (e.g., MyClass2.cs, MyClass3.cs).
-    /// </summary>
+    // --- FindNextAvailableNumber (Unchanged from original) ---
     private static int FindNextAvailableNumber(string directory, string fileName, string extension)
     {
-        // Regex to match files like "FileName<number>.ext"
-        // It captures the number part. Ensures it matches the whole filename.
         Regex regex = new Regex($@"^{Regex.Escape(fileName)}(\d+){Regex.Escape(extension)}$", RegexOptions.IgnoreCase);
-        int highestNumber = 1; // Start checking from 2 (so default is 2 if no numbered files exist)
-
-        try
-        {
+        int highestNumber = 1;
+        try {
             var existingFiles = Directory.EnumerateFiles(directory, $"{fileName}*{extension}");
-
-            foreach (string file in existingFiles)
-            {
+            foreach (string file in existingFiles) {
                 string nameOnly = Path.GetFileName(file);
                 Match match = regex.Match(nameOnly);
-                if (match.Success)
-                {
-                    if (int.TryParse(match.Groups[1].Value, out int number))
-                    {
-                        if (number > highestNumber)
-                        {
-                            highestNumber = number;
-                        }
-                    }
+                if (match.Success && int.TryParse(match.Groups[1].Value, out int number)) {
+                    highestNumber = Math.Max(highestNumber, number);
                 }
             }
+        } catch (DirectoryNotFoundException) {
+            Console.WriteLine($"Warning: Directory not found: {directory}"); return 2;
         }
-        catch (DirectoryNotFoundException)
-        {
-            // Ignore if directory doesn't exist, though it should based on input filePath
-            Console.WriteLine($"Warning: Directory not found: {directory}");
-            return 2; // Default starting number
-        }
-
-
-        return highestNumber + 1; // Return the next available number
+        return highestNumber + 1;
     }
 }
